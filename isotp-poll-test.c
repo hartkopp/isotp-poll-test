@@ -34,6 +34,18 @@ int main(int argc, char *argv[])
 	int buf_size = 0;
 	unsigned cnt = 1, max_msgs = 0;
 
+	/* for recvmsg() instead if read() */
+	char ctrlmsg[CMSG_SPACE(sizeof(__u32))]; /* only check for SO_RXQ_OVFL */
+	struct iovec iov;
+	struct msghdr msg;
+	struct cmsghdr *cmsg;
+
+	static __u32 dropcnt;
+	static __u32 last_dropcnt;
+
+	char buf[100];
+	int ret;
+
 	/* These default can be overridden with -s and -d */
 	addr.can_addr.tp.tx_id = 0x123;
 	addr.can_addr.tp.rx_id = 0x321;
@@ -83,6 +95,10 @@ int main(int argc, char *argv[])
 		CHECK(setsockopt(sock, SOL_CAN_ISOTP, CAN_ISOTP_OPTS, &opts, sizeof(opts)));
 	}
 
+	/* enable drop monitoring */
+	const int dropmonitor_on = 1;
+	CHECK(setsockopt(sock, SOL_SOCKET, SO_RXQ_OVFL, &dropmonitor_on, sizeof(dropmonitor_on)));
+
 	const char *ifname = "vcan0";
 	addr.can_family = AF_CAN;
 	addr.can_ifindex = if_nametoindex(ifname);
@@ -101,15 +117,44 @@ int main(int argc, char *argv[])
 		.events = ((in ? POLLIN : 0) | ((out & !in) ? POLLOUT : 0))
 	};
 
-	do {
-		char buf[100];
-		int ret;
+	/* these settings are static and can be held out of the hot path */
+	msg.msg_name = &addr;
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = &ctrlmsg;
+	iov.iov_base = buf;
 
+	do {
 		if (!blocking)
 			CHECK(poll(&pollfd, 1, -1)); /* Wait with infinite timeout */
 
 		if (pollfd.revents & POLLIN || (blocking && in)) {
-			buf_size = CHECK(read(sock, buf, sizeof(buf) - 1));
+
+			iov.iov_len = sizeof(buf);
+			msg.msg_namelen = sizeof(addr);
+			msg.msg_controllen = sizeof(ctrlmsg);
+			msg.msg_flags = 0;
+
+			buf_size = CHECK(recvmsg(sock, &msg, 0));
+
+			for (cmsg = CMSG_FIRSTHDR(&msg);
+			     cmsg && (cmsg->cmsg_level == SOL_SOCKET);
+			     cmsg = CMSG_NXTHDR(&msg,cmsg)) {
+				if (cmsg->cmsg_type == SO_RXQ_OVFL) {
+					memcpy(&dropcnt, CMSG_DATA(cmsg), sizeof(__u32));
+				}
+			}
+
+			/* check for (unlikely) dropped frames on this specific socket */
+			if (dropcnt != last_dropcnt) {
+				__u32 frames = dropcnt - last_dropcnt;
+
+				printf("DROPCOUNT: dropped %u CAN frame%s socket (total drops %u)\n",
+				       frames, (frames > 1)?"s":"", dropcnt);
+
+				last_dropcnt = dropcnt;
+			}
+
 			if (!quiet)
 				printf("#%u: Read %d bytes\n", cnt, buf_size);
 			if (validate_seq) {
