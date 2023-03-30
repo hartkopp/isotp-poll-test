@@ -42,6 +42,7 @@ int main(int argc, char *argv[])
 
 	static __u32 dropcnt;
 	static __u32 last_dropcnt;
+	static int rcvbuf_size;
 
 	char buf[100];
 	int ret;
@@ -50,7 +51,7 @@ int main(int argc, char *argv[])
 	addr.can_addr.tp.tx_id = 0x123;
 	addr.can_addr.tp.rx_id = 0x321;
 
-	while ((opt = getopt(argc, argv, "abc:d:ioqs:w")) != -1) {
+	while ((opt = getopt(argc, argv, "abc:d:ioqr:s:w")) != -1) {
 		switch (opt) {
 		case 'a':
 			validate_seq = true;
@@ -73,6 +74,13 @@ int main(int argc, char *argv[])
 		case 'w':
 			wait_tx_done = true;
 			break;
+
+		case 'r':
+			rcvbuf_size = atoi(optarg);
+			if (rcvbuf_size < 1)
+				err(EXIT_FAILURE, "Usage: %s [-i] [-o]", argv[0]);
+			break;
+
 		case 's':
 			addr.can_addr.tp.tx_id = strtoul(optarg, NULL, 16);
 			if (strlen(optarg) > 7)
@@ -98,6 +106,34 @@ int main(int argc, char *argv[])
 	/* enable drop monitoring */
 	const int dropmonitor_on = 1;
 	CHECK(setsockopt(sock, SOL_SOCKET, SO_RXQ_OVFL, &dropmonitor_on, sizeof(dropmonitor_on)));
+
+	if (rcvbuf_size) {
+		int curr_rcvbuf_size;
+		socklen_t curr_rcvbuf_size_len = sizeof(curr_rcvbuf_size);
+
+		/* try SO_RCVBUFFORCE first, if we run with CAP_NET_ADMIN */
+		if (setsockopt(sock, SOL_SOCKET, SO_RCVBUFFORCE,
+			       &rcvbuf_size, sizeof(rcvbuf_size)) < 0) {
+			printf("SO_RCVBUFFORCE failed so try SO_RCVBUF ...\n");
+			if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+				       &rcvbuf_size, sizeof(rcvbuf_size)) < 0) {
+				perror("setsockopt SO_RCVBUF");
+				return 1;
+			}
+
+			if (getsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+				       &curr_rcvbuf_size, &curr_rcvbuf_size_len) < 0) {
+				perror("getsockopt SO_RCVBUF");
+				return 1;
+			}
+
+			/* Only print a warning the first time we detect the adjustment */
+			/* n.b.: The wanted size is doubled in Linux in net/sore/sock.c */
+			if (curr_rcvbuf_size < rcvbuf_size * 2)
+				fprintf(stderr, "The socket receive buffer size was "
+					"adjusted due to /proc/sys/net/core/rmem_max.\n");
+		}
+	}
 
 	const char *ifname = "vcan0";
 	addr.can_family = AF_CAN;
